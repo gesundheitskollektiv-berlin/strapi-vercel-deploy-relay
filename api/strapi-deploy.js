@@ -132,19 +132,25 @@ export default async function handler(req, res) {
 		return res.status(405).json({ error: 'Method Not Allowed' });
 	}
 
-	const expectedSecret = process.env.RELAYER_SHARED_SECRET;
-	if (!expectedSecret || !String(expectedSecret).trim()) {
-		console.error('[strapi-deploy] RELAYER_SHARED_SECRET is not set');
-		return res.status(500).json({ error: 'Server misconfiguration' });
-	}
+	const skipAuth = /^1|true|yes$/i.test(String(process.env.RELAYER_SKIP_AUTH ?? '').trim());
 
-	const provided = extractSharedSecret(
-		req.headers && typeof req.headers === 'object'
-			? /** @type {Record<string, unknown>} */ (req.headers)
-			: undefined
-	);
-	if (!timingSafeEqualString(provided, String(expectedSecret).trim())) {
-		return res.status(401).json({ error: 'Unauthorized' });
+	if (skipAuth) {
+		console.warn('[strapi-deploy] RELAYER_SKIP_AUTH is set — authentication disabled (testing only)');
+	} else {
+		const expectedSecret = process.env.RELAYER_SHARED_SECRET;
+		if (!expectedSecret || !String(expectedSecret).trim()) {
+			console.error('[strapi-deploy] RELAYER_SHARED_SECRET is not set');
+			return res.status(500).json({ error: 'Server misconfiguration' });
+		}
+
+		const provided = extractSharedSecret(
+			req.headers && typeof req.headers === 'object'
+				? /** @type {Record<string, unknown>} */ (req.headers)
+				: undefined
+		);
+		if (!timingSafeEqualString(provided, String(expectedSecret).trim())) {
+			return res.status(401).json({ error: 'Unauthorized' });
+		}
 	}
 
 	let body = req.body;
