@@ -27,31 +27,58 @@ function timingSafeEqualString(a, b) {
 	}
 }
 
-/** Node / Vercel lowercases header keys. */
+/** Vercel / Node usually lowercase keys; fall back to case-insensitive scan. */
 function getHeaderValue(headers, nameLower) {
 	if (!headers || typeof headers !== 'object') return '';
-	const raw = /** @type {Record<string, unknown>} */ (headers)[nameLower];
+	const h = /** @type {Record<string, unknown>} */ (headers);
+	let raw = h[nameLower];
+	if (raw === undefined) {
+		for (const key of Object.keys(h)) {
+			if (key.toLowerCase() === nameLower) {
+				raw = h[key];
+				break;
+			}
+		}
+	}
 	const v = Array.isArray(raw) ? raw[0] : raw;
 	return typeof v === 'string' ? v.trim() : '';
 }
 
 /**
- * Strapi Admin often sends a custom header (e.g. `relayer-shared-secret`) instead of
- * `Authorization: Bearer …`; accept both against `RELAYER_SHARED_SECRET`.
+ * Collect every credential Strapi might send; then accept if **any** matches
+ * `RELAYER_SHARED_SECRET`. Avoids a junk `Authorization` blocking
+ * `relayer-shared-secret` and matches custom header names reliably.
  *
  * @param {Record<string, unknown> | undefined} headers
- * @returns {string}
+ * @returns {string[]}
  */
-function extractSharedSecret(headers) {
+function listCredentialStrings(headers) {
+	if (!headers || typeof headers !== 'object') return [];
+	/** @type {string[]} */
+	const out = [];
 	const authorization = getHeaderValue(headers, 'authorization');
 	if (authorization.toLowerCase().startsWith('bearer ')) {
-		return authorization.slice(7).trim();
+		const t = authorization.slice(7).trim();
+		if (t) out.push(t);
 	}
-	return (
-		getHeaderValue(headers, 'relayer-shared-secret') ||
-		getHeaderValue(headers, 'x-relayer-shared-secret') ||
-		''
-	);
+	for (const name of ['relayer-shared-secret', 'x-relayer-shared-secret']) {
+		const v = getHeaderValue(headers, name);
+		if (v) out.push(v);
+	}
+	return out;
+}
+
+/**
+ * @param {Record<string, unknown> | undefined} headers
+ * @param {string} expected
+ */
+function sharedSecretAuthorized(headers, expected) {
+	const exp = String(expected).trim();
+	if (!exp) return false;
+	for (const c of listCredentialStrings(headers)) {
+		if (timingSafeEqualString(c, exp)) return true;
+	}
+	return false;
 }
 
 /**
@@ -143,12 +170,11 @@ export default async function handler(req, res) {
 			return res.status(500).json({ error: 'Server misconfiguration' });
 		}
 
-		const provided = extractSharedSecret(
+		const hdr =
 			req.headers && typeof req.headers === 'object'
 				? /** @type {Record<string, unknown>} */ (req.headers)
-				: undefined
-		);
-		if (!timingSafeEqualString(provided, String(expectedSecret).trim())) {
+				: undefined;
+		if (!sharedSecretAuthorized(hdr, String(expectedSecret))) {
 			return res.status(401).json({ error: 'Unauthorized' });
 		}
 	}
