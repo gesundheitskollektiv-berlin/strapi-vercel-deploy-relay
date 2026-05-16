@@ -1,22 +1,26 @@
 import crypto from 'node:crypto';
 
-/** @typedef {'kipra'|'geko'|'alpra'} Site */
-
-/** Strapi upload file content-type UID (confirm with a real webhook if this changes). */
 const UPLOAD_FILE_UID = 'plugin::upload.file';
 
-const CONTENT_UID_PREFIX = /^api::(kipra|geko|alpra)-/;
-
-const MEDIA_ROOT_SEGMENT = /^(kipra|geko|alpra)(\/|$)/i;
-
-const HOOK_BY_SITE = /** @type {const} */ ({
+const HOOKS = {
 	kipra: 'VERCEL_DEPLOY_HOOK_KIPRA',
 	geko: 'VERCEL_DEPLOY_HOOK_GEKO',
 	alpra: 'VERCEL_DEPLOY_HOOK_ALPRA'
-});
+};
 
-/** @param {string} a @param {string} b */
-function timingSafeEqualString(a, b) {
+const SITES = Object.keys(HOOKS);
+const CONTENT_UID = new RegExp(`^api::(${SITES.join('|')})-`);
+const MEDIA_ROOT = new RegExp(`^(${SITES.join('|')})(\\/|$)`, 'i');
+
+function isTruthy(v) {
+	return /^1|true|yes$/i.test(String(v ?? '').trim());
+}
+
+function sha12(s) {
+	return crypto.createHash('sha256').update(s, 'utf8').digest('hex').slice(0, 12);
+}
+
+function timingSafeEqualStr(a, b) {
 	try {
 		const ba = Buffer.from(a, 'utf8');
 		const bb = Buffer.from(b, 'utf8');
@@ -27,8 +31,7 @@ function timingSafeEqualString(a, b) {
 	}
 }
 
-/** Vercel / Node usually lowercase keys; fall back to case-insensitive scan. */
-function getHeaderValue(headers, nameLower) {
+function header(headers, nameLower) {
 	if (!headers || typeof headers !== 'object') return '';
 	const h = /** @type {Record<string, unknown>} */ (headers);
 	let raw = h[nameLower];
@@ -44,49 +47,87 @@ function getHeaderValue(headers, nameLower) {
 	return typeof v === 'string' ? v.trim() : '';
 }
 
-/**
- * Collect every credential Strapi might send; then accept if **any** matches
- * `RELAYER_SHARED_SECRET`. Avoids a junk `Authorization` blocking
- * `relayer-shared-secret` and matches custom header names reliably.
- *
- * @param {Record<string, unknown> | undefined} headers
- * @returns {string[]}
- */
-function listCredentialStrings(headers) {
+function extractCredentials(headers) {
 	if (!headers || typeof headers !== 'object') return [];
-	/** @type {string[]} */
+	/** @type {{ source: string; value: string }[]} */
 	const out = [];
-	const authorization = getHeaderValue(headers, 'authorization');
+	const authorization = header(headers, 'authorization');
 	if (authorization.toLowerCase().startsWith('bearer ')) {
 		const t = authorization.slice(7).trim();
-		if (t) out.push(t);
+		if (t) out.push({ source: 'authorization-bearer', value: t });
 	}
 	for (const name of ['relayer-shared-secret', 'x-relayer-shared-secret']) {
-		const v = getHeaderValue(headers, name);
-		if (v) out.push(v);
+		const v = header(headers, name);
+		if (v) out.push({ source: name, value: v });
 	}
 	return out;
 }
 
-/**
- * @param {Record<string, unknown> | undefined} headers
- * @param {string} expected
- */
-function sharedSecretAuthorized(headers, expected) {
-	const exp = String(expected).trim();
-	if (!exp) return false;
-	for (const c of listCredentialStrings(headers)) {
-		if (timingSafeEqualString(c, exp)) return true;
-	}
-	return false;
+function buildAuthDebug(headers, expected) {
+	const h = headers && typeof headers === 'object' ? /** @type {Record<string, unknown>} */ (headers) : {};
+	const headerNames = Object.keys(h);
+	const candidates = extractCredentials(headers).map(({ source, value }) => ({
+		source,
+		length: value.length,
+		sha12: sha12(value)
+	}));
+	return {
+		headerNames,
+		candidates,
+		expected: { length: expected.length, sha12: sha12(expected) }
+	};
 }
 
 /**
- * Join folder ancestry from webhook `entry.folder` (+ optional `parent` chain).
- * @param {unknown} entry
- * @returns {string}
+ * @param {{ headers?: Record<string, unknown> }} req
+ * @returns {{ ok: true } | { ok: false; status: number; body: Record<string, unknown> }}
  */
-function folderPathFromEntry(entry) {
+function authorize(req) {
+	if (isTruthy(process.env.RELAYER_SKIP_AUTH)) {
+		console.warn('[strapi-deploy] RELAYER_SKIP_AUTH is set — authentication disabled (testing only)');
+		return { ok: true };
+	}
+	const expected = String(process.env.RELAYER_SHARED_SECRET ?? '').trim();
+	if (!expected) {
+		console.error('[strapi-deploy] RELAYER_SHARED_SECRET is not set');
+		return { ok: false, status: 500, body: { error: 'Server misconfiguration' } };
+	}
+	const hdr =
+		req.headers && typeof req.headers === 'object'
+			? /** @type {Record<string, unknown>} */ (req.headers)
+			: undefined;
+	for (const { value } of extractCredentials(hdr)) {
+		if (timingSafeEqualStr(value, expected)) {
+			if (isTruthy(process.env.RELAYER_DEBUG_AUTH)) {
+				console.warn('[strapi-deploy] auth ok', buildAuthDebug(hdr, expected));
+			}
+			return { ok: true };
+		}
+	}
+	const debug = isTruthy(process.env.RELAYER_DEBUG_AUTH) ? buildAuthDebug(hdr, expected) : null;
+	if (debug) console.warn('[strapi-deploy] auth failed', debug);
+	return {
+		ok: false,
+		status: 401,
+		body: debug ? { error: 'Unauthorized', debug } : { error: 'Unauthorized' }
+	};
+}
+
+/** @param {unknown} body */
+function parseJsonBody(body) {
+	if (typeof body === 'string') {
+		try {
+			body = JSON.parse(body);
+		} catch {
+			return null;
+		}
+	}
+	if (!body || typeof body !== 'object') return null;
+	return /** @type {Record<string, unknown>} */ (body);
+}
+
+/** @param {unknown} entry */
+function folderPath(entry) {
 	if (!entry || typeof entry !== 'object') return '';
 	const o = /** @type {Record<string, unknown>} */ (entry);
 	const segments = [];
@@ -107,33 +148,38 @@ function folderPathFromEntry(entry) {
 	return segments.join('/');
 }
 
+function hookUrlForSite(site) {
+	const key = HOOKS[/** @type {keyof typeof HOOKS} */ (site)];
+	const url = key ? process.env[key] : undefined;
+	return typeof url === 'string' && url.trim() ? url.trim() : undefined;
+}
+
 /**
  * @param {string} uid
  * @param {unknown} entry
- * @returns {{ site: Site | null, reason: string, folderPath?: string }}
  */
 function resolveSite(uid, entry) {
 	if (typeof uid !== 'string' || !uid) {
 		return { site: null, reason: 'missing_uid' };
 	}
 
-	const content = CONTENT_UID_PREFIX.exec(uid);
+	const content = CONTENT_UID.exec(uid);
 	if (content) {
-		const site = /** @type {Site} */ (content[1]);
+		const site = content[1].toLowerCase();
 		return { site, reason: 'content_type' };
 	}
 
 	if (uid === UPLOAD_FILE_UID) {
-		const folderPath = folderPathFromEntry(entry);
-		const m = MEDIA_ROOT_SEGMENT.exec(folderPath);
+		const fp = folderPath(entry);
+		const m = MEDIA_ROOT.exec(fp);
 		if (m) {
-			const site = /** @type {Site} */ (m[1].toLowerCase());
-			return { site, reason: 'media_folder', folderPath };
+			const site = m[1].toLowerCase();
+			return { site, reason: 'media_folder', folderPath: fp };
 		}
 		return {
 			site: null,
-			reason: folderPath ? 'media_folder_unmatched' : 'media_no_folder_path',
-			folderPath: folderPath || undefined
+			reason: fp ? 'media_folder_unmatched' : 'media_no_folder_path',
+			folderPath: fp || undefined
 		};
 	}
 
@@ -141,17 +187,24 @@ function resolveSite(uid, entry) {
 }
 
 /**
- * @param {Site} site
- * @returns {string | undefined}
+ * @param {string} site
+ * @returns {Promise<{ ok: boolean; status: number; preview: string } | null>}
  */
-function hookUrlForSite(site) {
-	const key = HOOK_BY_SITE[site];
-	const url = key ? process.env[key] : undefined;
-	return typeof url === 'string' && url.trim() ? url.trim() : undefined;
+async function triggerHook(site) {
+	const hookUrl = hookUrlForSite(site);
+	if (!hookUrl) return null;
+	const upstream = await fetch(hookUrl, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: '{}'
+	});
+	const text = await upstream.text();
+	const preview = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+	return { ok: upstream.ok, status: upstream.status, preview };
 }
 
 /**
- * @param {{ method?: string, headers?: Record<string, unknown>, body?: unknown }} req
+ * @param {{ method?: string; headers?: Record<string, unknown>; body?: unknown }} req
  * @param {{ status: (n: number) => { json: (j: unknown) => void }}} res
  */
 export default async function handler(req, res) {
@@ -159,41 +212,17 @@ export default async function handler(req, res) {
 		return res.status(405).json({ error: 'Method Not Allowed' });
 	}
 
-	const skipAuth = /^1|true|yes$/i.test(String(process.env.RELAYER_SKIP_AUTH ?? '').trim());
-
-	if (skipAuth) {
-		console.warn('[strapi-deploy] RELAYER_SKIP_AUTH is set — authentication disabled (testing only)');
-	} else {
-		const expectedSecret = process.env.RELAYER_SHARED_SECRET;
-		if (!expectedSecret || !String(expectedSecret).trim()) {
-			console.error('[strapi-deploy] RELAYER_SHARED_SECRET is not set');
-			return res.status(500).json({ error: 'Server misconfiguration' });
-		}
-
-		const hdr =
-			req.headers && typeof req.headers === 'object'
-				? /** @type {Record<string, unknown>} */ (req.headers)
-				: undefined;
-		if (!sharedSecretAuthorized(hdr, String(expectedSecret))) {
-			return res.status(401).json({ error: 'Unauthorized' });
-		}
+	const auth = authorize(req);
+	if (!auth.ok) {
+		return res.status(auth.status).json(auth.body);
 	}
 
-	let body = req.body;
-	if (typeof body === 'string') {
-		try {
-			body = JSON.parse(body);
-		} catch {
-			return res.status(400).json({ error: 'Invalid JSON body' });
-		}
-	}
-	if (!body || typeof body !== 'object') {
+	const body = parseJsonBody(req.body);
+	if (!body) {
 		return res.status(400).json({ error: 'Invalid JSON body' });
 	}
 
-	const { uid } = /** @type {Record<string, unknown>} */ (body);
-	const entry = /** @type {Record<string, unknown>} */ (body).entry;
-
+	const { uid, entry } = body;
 	const resolved = resolveSite(typeof uid === 'string' ? uid : '', entry);
 
 	if (!resolved.site) {
@@ -210,28 +239,20 @@ export default async function handler(req, res) {
 		});
 	}
 
-	const hookUrl = hookUrlForSite(resolved.site);
-	if (!hookUrl) {
-		console.error('[strapi-deploy] missing env for site', resolved.site);
-		return res.status(500).json({ error: `Missing deploy hook env for ${resolved.site}` });
-	}
-
 	try {
-		const upstream = await fetch(hookUrl, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: '{}'
-		});
-		const text = await upstream.text();
-		const preview = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+		const upstream = await triggerHook(resolved.site);
+		if (!upstream) {
+			console.error('[strapi-deploy] missing env for site', resolved.site);
+			return res.status(500).json({ error: `Missing deploy hook env for ${resolved.site}` });
+		}
 		if (!upstream.ok) {
-			console.error('[strapi-deploy] hook failed', resolved.site, upstream.status, preview);
+			console.error('[strapi-deploy] hook failed', resolved.site, upstream.status, upstream.preview);
 			return res.status(502).json({
 				ok: false,
 				site: resolved.site,
 				reason: resolved.reason,
 				hookStatus: upstream.status,
-				hookBodyPreview: preview
+				hookBodyPreview: upstream.preview
 			});
 		}
 		return res.status(200).json({
