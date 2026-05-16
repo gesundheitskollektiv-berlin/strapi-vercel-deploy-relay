@@ -27,6 +27,33 @@ function timingSafeEqualString(a, b) {
 	}
 }
 
+/** Node / Vercel lowercases header keys. */
+function getHeaderValue(headers, nameLower) {
+	if (!headers || typeof headers !== 'object') return '';
+	const raw = /** @type {Record<string, unknown>} */ (headers)[nameLower];
+	const v = Array.isArray(raw) ? raw[0] : raw;
+	return typeof v === 'string' ? v.trim() : '';
+}
+
+/**
+ * Strapi Admin often sends a custom header (e.g. `relayer-shared-secret`) instead of
+ * `Authorization: Bearer …`; accept both against `RELAYER_SHARED_SECRET`.
+ *
+ * @param {Record<string, unknown> | undefined} headers
+ * @returns {string}
+ */
+function extractSharedSecret(headers) {
+	const authorization = getHeaderValue(headers, 'authorization');
+	if (authorization.toLowerCase().startsWith('bearer ')) {
+		return authorization.slice(7).trim();
+	}
+	return (
+		getHeaderValue(headers, 'relayer-shared-secret') ||
+		getHeaderValue(headers, 'x-relayer-shared-secret') ||
+		''
+	);
+}
+
 /**
  * Join folder ancestry from webhook `entry.folder` (+ optional `parent` chain).
  * @param {unknown} entry
@@ -111,10 +138,12 @@ export default async function handler(req, res) {
 		return res.status(500).json({ error: 'Server misconfiguration' });
 	}
 
-	const rawAuth = req.headers.authorization;
-	const auth = Array.isArray(rawAuth) ? rawAuth[0] : rawAuth;
-	const bearer = typeof auth === 'string' && auth.startsWith('Bearer ') ? auth.slice(7) : '';
-	if (!timingSafeEqualString(bearer, String(expectedSecret).trim())) {
+	const provided = extractSharedSecret(
+		req.headers && typeof req.headers === 'object'
+			? /** @type {Record<string, unknown>} */ (req.headers)
+			: undefined
+	);
+	if (!timingSafeEqualString(provided, String(expectedSecret).trim())) {
 		return res.status(401).json({ error: 'Unauthorized' });
 	}
 
