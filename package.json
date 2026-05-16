@@ -1,0 +1,13 @@
+{
+  "name": "strapi-vercel-deploy-relay",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Vercel serverless relay: Strapi webhook -> site-specific Vercel deploy hook",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "lint": "node --check api/strapi-deploy.js"
+  }
+}
